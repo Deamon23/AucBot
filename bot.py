@@ -11,6 +11,7 @@ import logging
 from typing import Any, Callable, Dict, Awaitable
 
 import aiohttp
+from aiohttp import resolver as aiohttp_resolver
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -30,6 +31,7 @@ from config import (
     CHECK_INTERVAL,
     CLIENT_ID,
     CLIENT_SECRET,
+    DNS_CACHE_TTL,
     REGION,
 )
 from storage import Storage
@@ -41,11 +43,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stalcraft-bot")
 
+# Настраиваем DNS кеш для aiohttp - кешируем DNS записи на заданное время
+# Это предотвращает проблемы с сессиями при временных сбоях DNS
+aiohttp_resolver.DefaultResolver._resolve_timeout = 10.0
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 storage = Storage()
 
-API_BASE = "https://eapi.stalcraft.net"
+API_BASE = "https://eapi.stalzone.net"
+OAUTH_URL = "https://exbo.net/oauth/token"
+
+# Глобальная сессия для повторного использования соединений и DNS кеша
+_session: aiohttp.ClientSession | None = None
+_access_token: str | None = None
+_token_expires_at: float = 0
+
+
+def get_session() -> aiohttp.ClientSession:
+    """Возвращает глобальную сессию для API запросов."""
+    global _session
+    if _session is None or _session.closed:
+        # Настраиваем таймауты и лимиты соединений
+        connector = aiohttp.TCPConnector(
+            ttl_dns_cache=DNS_CACHE_TTL,  # Кешируем DNS записи
+            limit=50,  # Максимум открытых соединений
+            limit_per_host=10,  # Максимум соединений на хост
+            enable_cleanup_closed=True,  # Очищаем закрытые соединения
+        )
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
+        _session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    return _session
+
+
+async def get_access_token(session: aiohttp.ClientSession) -> str:
+    """Получает и кэширует OAuth токен. Токен действителен 1 час."""
+    global _access_token, _token_expires_at
+    import time
+    
+    # Если токен ещё действителен (с запасом 5 минут), возвращаем его
+    if _access_token and time.time() < _token_expires_at - 300:
+        logger.debug("Используем кэшированный токен (действителен до %s)", _token_expires_at)
+        return _access_token
+    
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+    }
+    
+    async with session.post(OAUTH_URL, data=data) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            raise RuntimeError(f"OAuth ошибка {resp.status}: {text[:200]}")
+        result = await resp.json()
+        _access_token = result["access_token"]
+        expires_in = int(result.get("expires_in", 3600))
+        _token_expires_at = time.time() + expires_in
+        logger.info("Получен новый access_token, действителен %d секунд (до %s)", expires_in, _token_expires_at)
+        return _access_token
 
 MODULE_ITEM_ID = "1pyq"
 
@@ -203,6 +259,13 @@ class NewWatch(StatesGroup):
     confirm = State()
 
 
+class CheckFilter(StatesGroup):
+    """Состояния для фильтров команды /check"""
+    selecting_item = State()
+    rarity = State()
+    ptn = State()
+
+
 # ── API ──────────────────────────────────────────────────────────────────────
 
 async def fetch_lots(
@@ -222,9 +285,11 @@ async def fetch_lots(
         "order": order,
         "additional": "true",
     }
+    
+    # Получаем кэшированный OAuth токен
+    token = await get_access_token(session)
     headers = {
-        "Client-Id": CLIENT_ID,
-        "Client-Secret": CLIENT_SECRET,
+        "Authorization": f"Bearer {token}",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
@@ -235,7 +300,12 @@ async def fetch_lots(
                 url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=45)
             ) as resp:
                 if resp.status == 401:
-                    raise RuntimeError("Неверный CLIENT_ID или CLIENT_SECRET (ошибка 401)")
+                    # Токен истёк, пробуем обновить
+                    _globals = globals()
+                    _globals["_access_token"] = None
+                    token = await get_access_token(session)
+                    headers["Authorization"] = f"Bearer {token}"
+                    continue
                 if resp.status == 404:
                     return {"total": 0, "lots": []}
                 if resp.status == 429:
@@ -278,16 +348,16 @@ async def fetch_all_lots(
     Пропускает страницы с new=0 (дубли).
     При задержке API — игнорируем и переходим к следующему offset.
     """
-    page_size = 100
+    page_size = 200  # Максимальный размер страницы API
     all_lots: list = []
     seen_keys: set[str] = set()
     total = 0
     offset = 0
-    page_delay = 8.0
+    page_delay = 0.5  # Быстрая пагинация: 200 запросов в минуту
     is_module = item_id.lower() == MODULE_ITEM_ID
     max_dup_retries = 4
 
-    while offset < max_lots and len(all_lots) < max_lots:
+    while len(all_lots) < max_lots:
         data = await fetch_lots(
             session, item_id, limit=page_size, offset=offset, sort=sort, order=order
         )
@@ -303,7 +373,7 @@ async def fetch_all_lots(
 
         if is_module and not _page_has_module_attrs(lots):
             logger.warning("offset=%s: без attributes, повтор через 3s", offset)
-            await asyncio.sleep(8.0)
+            await asyncio.sleep(3.0)
             data = await fetch_lots(
                 session, item_id, limit=page_size, offset=offset, sort=sort, order=order
             )
@@ -333,7 +403,7 @@ async def fetch_all_lots(
 
         if total and offset >= total:
             break
-        if len(all_lots) >= max_lots or offset >= max_lots:
+        if len(all_lots) >= max_lots:
             break
         if len(lots) < page_size:
             break
@@ -756,15 +826,34 @@ async def cmd_tracks(message: Message, state: FSMContext) -> None:
 
 
 @dp.message(Command("check"))
-async def cmd_check(message: Message, command: CommandObject) -> None:
+async def cmd_check(message: Message, state: FSMContext, command: CommandObject) -> None:
     if not command.args:
         await message.answer(
-            "Укажи название или id:\n<code>/check Атом</code>",
+            "Укажи название или id:\n<code>/check Атом</code>\n\n"
+            "Можно добавить фильтры:\n"
+            "<code>/check Атом 3</code> — редкость (0-5)\n"
+            "<code>/check Атом +3</code> — заточка (+1...+15)",
             parse_mode="HTML",
         )
         return
 
-    query = command.args.strip()
+    args = command.args.strip().split()
+    query = args[0]
+    
+    # Парсинг фильтров
+    rarity_filter = None
+    ptn_filter = None
+    
+    for arg in args[1:]:
+        # Редкость: число 0-5
+        if arg.isdigit() and 0 <= int(arg) <= 5:
+            rarity_filter = int(arg)
+        # Заточка: +число
+        elif arg.startswith('+') and arg[1:].isdigit():
+            ptn_val = int(arg[1:])
+            if 0 <= ptn_val <= 15:
+                ptn_filter = ptn_val
+    
     results = items_db.search(query, limit=5)
 
     if not results:
@@ -783,6 +872,8 @@ async def cmd_check(message: Message, command: CommandObject) -> None:
             ]
             for r in results
         ]
+        # Сохраняем фильтры для последующего использования
+        await state.update_data(rarity=rarity_filter, ptn=ptn_filter, query=query)
         await message.answer(
             f"Найдено несколько по «{query}». Выбери:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -791,16 +882,16 @@ async def cmd_check(message: Message, command: CommandObject) -> None:
 
     await message.answer(f"🔍 Смотрю <b>{name}</b>…", parse_mode="HTML")
     try:
-        async with aiohttp.ClientSession() as session:
-            # Пагинация только по time_created — buyout_price даёт дубли в eapi
-            if item_id.lower() == MODULE_ITEM_ID:
-                data = await fetch_all_lots(
-                    session, item_id, max_lots=300, sort="time_created", order="asc"
-                )
-            else:
-                data = await fetch_all_lots(
-                    session, item_id, max_lots=5000, sort="time_created", order="asc"
-                )
+        session = get_session()
+        # Пагинация только по time_created — buyout_price даёт дубли в eapi
+        if item_id.lower() == MODULE_ITEM_ID:
+            data = await fetch_all_lots(
+                session, item_id, max_lots=2000, sort="time_created", order="asc"
+            )
+        else:
+            data = await fetch_all_lots(
+                session, item_id, max_lots=5000, sort="time_created", order="asc"
+            )
         raw_lots = data.get("lots") or []
         total = data.get("total", len(raw_lots))
         scanned = len(raw_lots)
@@ -809,9 +900,22 @@ async def cmd_check(message: Message, command: CommandObject) -> None:
             L for L in raw_lots
             if L.get("buyoutPrice") is not None and L.get("buyoutPrice") != 0
         ]
+        
+        # Применяем фильтры
+        if rarity_filter is not None:
+            lots = [L for L in lots if (L.get("additional") or {}).get("qlt") == rarity_filter]
+        if ptn_filter is not None:
+            lots = [L for L in lots if (L.get("additional") or {}).get("ptn") == ptn_filter]
+        
         if not lots:
+            filter_desc = []
+            if rarity_filter is not None:
+                filter_desc.append(f"редкость={rarity_filter}")
+            if ptn_filter is not None:
+                filter_desc.append(f"заточка=+{ptn_filter}")
+            filter_str = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
             await message.answer(
-                f"Лотов по <b>{name}</b> с выкупом нет "
+                f"Лотов по <b>{name}</b>{filter_str} с выкупом нет "
                 f"(скачано {scanned} / ~{total}).",
                 parse_mode="HTML",
             )
@@ -819,8 +923,14 @@ async def cmd_check(message: Message, command: CommandObject) -> None:
         # Сортировка по цене за шт. уже на нашей стороне
         lots = sorted(lots, key=unit_price)
         show_n = 15 if item_id.lower() == MODULE_ITEM_ID else 10
+        filter_desc = []
+        if rarity_filter is not None:
+            filter_desc.append(f"редкость={rarity_filter}")
+        if ptn_filter is not None:
+            filter_desc.append(f"заточка=+{ptn_filter}")
+        filter_str = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
         parts = [
-            f"📦 <b>{name}</b> — на ауке ~{total}, скачано {scanned}, "
+            f"📦 <b>{name}</b>{filter_str} — на ауке ~{total}, скачано {scanned}, "
             f"с выкупом {len(lots)}, показано {min(show_n, len(lots))} "
             f"(по цене за шт.)\n"
         ]
@@ -847,69 +957,29 @@ async def cmd_check(message: Message, command: CommandObject) -> None:
 
 
 @dp.callback_query(F.data.startswith("checkpick:"))
-async def cb_checkpick(call: CallbackQuery) -> None:
-    item_id = call.data.split(":", 1)[1]
-    name = items_db.get_name(item_id)
-    # Ответить сразу — иначе Telegram гасит callback через ~30с
+async def cb_checkpick(call: CallbackQuery, state: FSMContext) -> None:
     try:
-        await call.answer()
-    except Exception:
-        pass
-    await call.message.edit_text(f"🔍 Смотрю <b>{name}</b>…", parse_mode="HTML")
-    try:
-        async with aiohttp.ClientSession() as session:
-            if item_id.lower() == MODULE_ITEM_ID:
-                data = await fetch_all_lots(
-                    session, item_id, max_lots=300, sort="time_created", order="asc"
-                )
-            else:
-                data = await fetch_all_lots(
-                    session, item_id, max_lots=5000, sort="time_created", order="asc"
-                )
-        raw_lots = data.get("lots") or []
-        total = data.get("total", len(raw_lots))
-        scanned = len(raw_lots)
-        lots = [
-            L for L in raw_lots
-            if L.get("buyoutPrice") is not None and L.get("buyoutPrice") != 0
+        item_id = call.data.split(":", 1)[1]
+        name = items_db.get_name(item_id)
+        
+        # Сохраняем предмет в состоянии и переходим к выбору редкости
+        await state.update_data(item_id=item_id, item_name=name)
+        await state.set_state(CheckFilter.rarity)
+        
+        # Формируем клавиатуру с редкостями (0-5 + "Любая")
+        rows = [
+            [
+                InlineKeyboardButton(text=f"{QLT_NAMES[q]} ({q})", callback_data=f"check_rarity:{q}")
+                for q in range(6)
+            ],
+            [InlineKeyboardButton(text="Любая", callback_data="check_rarity:any")],
         ]
-        if not lots:
-            await call.message.edit_text(
-                f"Лотов по <b>{name}</b> с выкупом нет "
-                f"(скачано {scanned} / ~{total}).",
-                parse_mode="HTML",
-            )
-            return
-        lots = sorted(lots, key=unit_price)
-        show_n = 15 if item_id.lower() == MODULE_ITEM_ID else 10
-        parts = [
-            f"📦 <b>{name}</b> — на ауке ~{total}, скачано {scanned}, "
-            f"с выкупом {len(lots)}, показано {min(show_n, len(lots))} "
-            f"(по цене за шт.)\n"
-        ]
-        for lot in lots[:show_n]:
-            parts.append(format_lot(lot, item_id))
-            parts.append("────────")
-        text = "\n".join(parts)
-        if len(text) > 4000:
-            # Результаты длинные — шлём новым сообщением
-            await call.message.edit_text(
-                f"📦 <b>{name}</b> — на ауке ~{total}, скачано {scanned}. "
-                f"Результат ниже:",
-                parse_mode="HTML",
-            )
-            chunk = ""
-            for p in parts[1:]:
-                if len(chunk) + len(p) + 1 > 4000:
-                    if chunk.strip():
-                        await call.message.answer(chunk, parse_mode="HTML")
-                    chunk = p + "\n"
-                else:
-                    chunk += p + "\n"
-            if chunk.strip():
-                await call.message.answer(chunk, parse_mode="HTML")
-        else:
-            await call.message.edit_text(text, parse_mode="HTML")
+        
+        await call.message.edit_text(
+            f"<b>{name}</b>\nВыберите редкость:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
     except Exception as e:
         logger.exception("checkpick failed")
         try:
@@ -1138,6 +1208,134 @@ async def cb_qlt(call: CallbackQuery, state: FSMContext) -> None:
             reply_markup=kb_ptn(),
         )
     await call.answer()
+
+
+# Обработчики для команды /check
+@dp.callback_query(StateFilter(CheckFilter.rarity), F.data.startswith("check_rarity:"))
+async def cb_check_rarity(call: CallbackQuery, state: FSMContext) -> None:
+    val = call.data.split(":")[1]
+    rarity = None if val == "any" else int(val)
+    await state.update_data(rarity=rarity)
+    
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    item_name = data.get("item_name")
+    rarity_s = "любая" if rarity is None else QLT_NAMES.get(rarity, str(rarity))
+    
+    # Проверяем, нужен ли выбор заточки (для артефактов и оружия)
+    # Простая эвристика: если предмет не модуль и не расходник, предлагаем заточку
+    # Для точности можно добавить проверку в items_db
+    await state.set_state(CheckFilter.ptn)
+    
+    rows = [[InlineKeyboardButton(text="Любая", callback_data="check_ptn:any")]]
+    row = []
+    for i in range(0, 16):
+        row.append(InlineKeyboardButton(text=f"+{i}", callback_data=f"check_ptn:{i}"))
+        if len(row) == 8:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    
+    await call.message.edit_text(
+        f"🎖 Редкость: <b>{rarity_s}</b>\n\nВыбери <b>заточку</b>:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(StateFilter(CheckFilter.ptn), F.data.startswith("check_ptn:"))
+async def cb_check_ptn(call: CallbackQuery, state: FSMContext) -> None:
+    val = call.data.split(":")[1]
+    ptn = None if val == "any" else int(val)
+    await state.update_data(ptn=ptn)
+    
+    data = await state.get_data()
+    item_id = data.get("item_id")
+    item_name = data.get("item_name")
+    rarity = data.get("rarity")
+    ptn_s = "любая" if ptn is None else f"+{ptn}"
+    
+    await state.clear()
+    
+    # Теперь выполняем поиск с фильтрами
+    try:
+        await call.message.edit_text(f"🔍 Смотрю <b>{item_name}</b>…", parse_mode="HTML")
+        session = get_session()
+        if item_id.lower() == MODULE_ITEM_ID:
+            fetch_data = await fetch_all_lots(
+                session, item_id, max_lots=2000, sort="time_created", order="asc"
+            )
+        else:
+            fetch_data = await fetch_all_lots(
+                session, item_id, max_lots=5000, sort="time_created", order="asc"
+            )
+        raw_lots = fetch_data.get("lots") or []
+        total = fetch_data.get("total", len(raw_lots))
+        scanned = len(raw_lots)
+        lots = [
+            L for L in raw_lots
+            if L.get("buyoutPrice") is not None and L.get("buyoutPrice") != 0
+        ]
+        
+        # Применяем фильтры
+        if rarity is not None:
+            lots = [L for L in lots if (L.get("additional") or {}).get("qlt") == rarity]
+        if ptn is not None:
+            lots = [L for L in lots if (L.get("additional") or {}).get("ptn") == ptn]
+        
+        if not lots:
+            filter_desc = []
+            if rarity is not None:
+                filter_desc.append(f"редкость={rarity}")
+            if ptn is not None:
+                filter_desc.append(f"заточка=+{ptn}")
+            filter_str = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
+            await call.message.edit_text(
+                f"Лотов по <b>{item_name}</b>{filter_str} с выкупом нет "
+                f"(скачано {scanned} / ~{total}).",
+                parse_mode="HTML",
+            )
+            return
+        lots = sorted(lots, key=unit_price)
+        show_n = 15 if item_id.lower() == MODULE_ITEM_ID else 10
+        filter_desc = []
+        if rarity is not None:
+            filter_desc.append(f"редкость={rarity}")
+        if ptn is not None:
+            filter_desc.append(f"заточка=+{ptn}")
+        filter_str = " (" + ", ".join(filter_desc) + ")" if filter_desc else ""
+        parts = [
+            f"📦 <b>{item_name}</b>{filter_str} — на ауке ~{total}, скачано {scanned}, "
+            f"с выкупом {len(lots)}, показано {min(show_n, len(lots))} "
+            f"(по цене за шт.)\n"
+        ]
+        for lot in lots[:show_n]:
+            parts.append(format_lot(lot, item_id))
+            parts.append("────────")
+        text = "\n".join(parts)
+        if len(text) > 4000:
+            await call.message.edit_text(
+                f"📦 <b>{item_name}</b>{filter_str} — на ауке ~{total}, скачано {scanned}. "
+                f"Результат ниже:",
+                parse_mode="HTML",
+            )
+            chunk = ""
+            for p in parts[1:]:
+                if len(chunk) + len(p) + 1 > 4000:
+                    if chunk.strip():
+                        await call.message.answer(chunk, parse_mode="HTML")
+                    chunk = p + "\n"
+                else:
+                    chunk += p + "\n"
+            if chunk.strip():
+                await call.message.answer(chunk, parse_mode="HTML")
+        else:
+            await call.message.edit_text(text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception("check failed")
+        await call.message.edit_text(f"Ошибка: <code>{e}</code>", parse_mode="HTML")
 
 
 @dp.callback_query(StateFilter(NewWatch.ptn), F.data.startswith("ptn:"))
@@ -1397,12 +1595,12 @@ async def cb_confirm(call: CallbackQuery, state: FSMContext) -> None:
     item_id = watch["item_id"]
     try:
         await call.message.answer("🔍 Сканирую аукцион…")
-        async with aiohttp.ClientSession() as session:
-            # Снимок: 200 самых дешёвых (чтобы сразу показать, что уже есть).
-            # Новые лоты дальше ловит monitor по time_created.
-            resp = await fetch_lots(
-                session, item_id, limit=200, sort="buyout_price", order="asc"
-            )
+        session = get_session()
+        # Снимок: 200 самых дешёвых (чтобы сразу показать, что уже есть).
+        # Новые лоты дальше ловит monitor по time_created.
+        resp = await fetch_lots(
+            session, item_id, limit=200, sort="buyout_price", order="asc"
+        )
         lots = resp.get("lots") or []
         total_on_ah = resp.get("total", len(lots))
 
