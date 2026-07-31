@@ -1,0 +1,40 @@
+```
+# Cache and temporary data
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dependency directories
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Data files that might be cached/generated
+data/*.json
+```

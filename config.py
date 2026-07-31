@@ -24,3 +24,6 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в .env")
 if not CLIENT_ID or not CLIENT_SECRET:
     raise ValueError("CLIENT_ID и CLIENT_SECRET должны быть заданы в .env")
+
+# DNS cache TTL (в секундах) - кешируем DNS записи чтобы избежать проблем при временных сбоях
+DNS_CACHE_TTL = int(os.getenv("DNS_CACHE_TTL", "300"))
